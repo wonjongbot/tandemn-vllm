@@ -222,7 +222,7 @@ class MiniLLM:
             _ = sampler(h, r)
 
         # Mimic vLLM completion object (enough for inference_utils last peer path)
-        return [SimpleNamespace(outputs=[SimpleNamespace(text="ok")])]
+        return [SimpleNamespace(outputs=[SimpleNamespace(text="fakeoutput")])]
 
 class SamplingParams(SimpleNamespace):
     """

@@ -1,4 +1,4 @@
-
+import argparse
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -37,7 +37,7 @@ import torch.nn as nn
 import multiprocessing as mp
 
 from src.utils.deployment_utils import load_model_with_selective_layers
-
+from pathlib import Path
 from src.utils.tensor_protocol_adapter import TensorTransport
 from src.utils.inference_utils import (
     register_inference_hooks,
@@ -46,7 +46,6 @@ from src.utils.inference_utils import (
     STEP_EVENTS_SAMPLER,
 )
 from src.utils.message_processing import extract_request_metadata
-from experimental_code.sp_inference_testbed import MiniLLM, SamplingParams
 
 import importlib
 import contextlib
@@ -105,13 +104,18 @@ async def _cancel_and_drain(*tasks):
     # give the loop a tick to process any final callbacks
     await asyncio.sleep(0)
 
-async def peer_main(role, conn, start_evt, max_tokens):
+async def peer_main(role, conn, start_evt, max_tokens, USE_VLLM):
     """
     One peer process that spwans LLM(mock for now) but uses real tensortransport.
     ctrl_{recv,send}: duplex Pipe endpoints to talk to parent
     start_evt: multiprocessing.Event shared from parent
     """
-    
+    # ------- PROFILER -------
+    import cProfile, pstats, io
+    pr = cProfile.Profile()
+    pr.enable()
+    # ----- END PROFILER -----
+
     # Start tenstortransport
     tt = TensorTransport()
     await tt.start()
@@ -135,11 +139,19 @@ async def peer_main(role, conn, start_evt, max_tokens):
 
 
     # Instantiate LLM
-    llm = MiniLLM(hidden_size=64)
-    
-    # load_model_with_selective_layers()
-    
-
+    if USE_VLLM:
+        llm = await load_model_with_selective_layers(
+                    Path("deployed_models/meta-llama/Llama-3.2-1B-Instruct"),
+                    assigned_layers[cur_ticket],
+                    quantization=None,
+                    dtype=None,
+                    use_async_engine=False,
+                    max_num_seqs=1,
+                    max_num_batched_tokens=2048,
+                )
+    else:
+        from experimental_code.sp_inference_testbed import MiniLLM
+        llm = MiniLLM(hidden_size=64)
     # Register hooks
     start_infer = register_inference_hooks(
         llm=llm,
@@ -166,28 +178,36 @@ async def peer_main(role, conn, start_evt, max_tokens):
     # start_evt.wait()
 
     # Run
-    sp = SamplingParams(max_tokens=max_tokens)
+    if USE_VLLM:
+        from vllm import SamplingParams
+        sp = SamplingParams(temperature=0.1, top_p=0.9, max_tokens=max_tokens)
+    else:
+        from experimental_code.sp_inference_testbed import SamplingParams
+        sp = SamplingParams(max_tokens=max_tokens)
+
     loop = asyncio.get_running_loop()
 
     try:
         await loop.run_in_executor(
-            None, start_infer, run_id, pipeline, "foomsg", sp, assigned_layers
+            None, start_infer, run_id, pipeline, "Hello, my name is", sp, assigned_layers
         )
     finally:
+        pr.disable()
+        pr.dump_stats(f"prof_{cur_idx}.out")
         await _cancel_and_drain(gateway_task)
 
-def _wrap(role, child_conn, start_evt, max_tokens):
-    asyncio.run(peer_main(role, child_conn, start_evt, max_tokens))
+def _wrap(role, child_conn, start_evt, max_tokens, USE_VLLM):
+    asyncio.run(peer_main(role, child_conn, start_evt, max_tokens, USE_VLLM))
 
-def spawn_two_peers(max_tokens=32):
+def spawn_two_peers(max_tokens=32, USE_VLLM=False):
     ctx = mp.get_context("spawn")
     start_evt = ctx.Event()
 
     p0_parent, p0_child = ctx.Pipe(duplex=True)
     p1_parent, p1_child = ctx.Pipe(duplex=True)
 
-    p0 = ctx.Process(target=_wrap, args=("peer0",p0_child,start_evt,max_tokens))
-    p1 = ctx.Process(target=_wrap, args=("peer1",p1_child,start_evt,max_tokens))
+    p0 = ctx.Process(target=_wrap, args=("peer0",p0_child,start_evt,max_tokens, USE_VLLM))
+    p1 = ctx.Process(target=_wrap, args=("peer1",p1_child,start_evt,max_tokens, USE_VLLM))
     p0.start()
     p1.start()
 
@@ -195,7 +215,7 @@ def spawn_two_peers(max_tokens=32):
     t1 = p1_parent.recv()["ticket"]
     pipeline = [t0,t1]
 
-    assigned_layers = {t0:[0], t1:[1]}
+    assigned_layers = {t0:[0,1,2,3,4,5,6,7], t1:[8,9,10,11,12,13,14,15]}
     run_id = f"req_{int(time.time()*1000)}"
 
     msg = {
@@ -219,6 +239,18 @@ def spawn_two_peers(max_tokens=32):
     p0.join()
     p1.join()
 
-
 if __name__ == "__main__":
-    spawn_two_peers(max_tokens=4)
+    parser = argparse.ArgumentParser(description="Test inference utils on single machine")
+    parser.add_argument("--vllm", action='store_true', help="Unique peer identifier (e.g., peer_1)")
+    args = parser.parse_args()
+    
+    USE_VLLM = None
+
+    if not args.vllm:
+        print("Using bogus vllm instance...")
+        USE_VLLM = False
+    else:
+        print("Using real vllm instance...")
+        USE_VLLM = True
+    
+    spawn_two_peers(max_tokens=10, USE_VLLM=USE_VLLM)
